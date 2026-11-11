@@ -1,6 +1,7 @@
 
 import os
 import re
+import json
 import ssl
 import secrets
 import logging
@@ -1705,117 +1706,574 @@ def get_profile_activity():
 # ANALYSIS API
 # ==================================================
 
+
 @app.post("/api/analyze")
 def analyze():
-
     data = request.get_json(silent=True) or {}
 
-    return jsonify({
+    # Get data sent by the React frontend
+    skills = data.get("skills", "")
+    role = data.get("target_role", "Software Developer Intern")
+    description = data.get("job_description", "")
 
-        "mode": "demo",
+    # Check whether Gemini is configured
+    if not client:
+        return jsonify({
+            "error": "Gemini API is not configured. Please check GEMINI_API_KEY."
+        }), 503
 
-        "target_role": data.get(
-            "target_role",
-            "Software Developer Intern"
-        ),
+    # Convert skills into readable text
+    if isinstance(skills, list):
+        skills_text = ", ".join(str(skill) for skill in skills)
+    else:
+        skills_text = str(skills)
 
-        "skill_gaps": [
-            "Git & GitHub",
-            "Portfolio Project",
-            "API Integration"
-        ],
+    prompt = f"""
+You are an expert AI career advisor and technical recruiter.
 
-        "hiring_signals": [
-            "Clean code",
-            "Working demo link",
-            "Structured documentation"
-        ],
+Analyze the candidate's skills and target job role.
 
-        "portfolio_ideas": [
-            {
-                "title": "Full-Stack Task App",
-                "description": "Build a CRUD app."
+TARGET ROLE:
+{role}
+
+CURRENT SKILLS:
+{skills_text}
+
+JOB DESCRIPTION:
+{description if description else "No job description provided."}
+
+Your task:
+1. Identify 5-8 important missing or weak skills.
+2. Identify 4-6 important hiring signals recruiters expect.
+3. Suggest 3 practical portfolio projects relevant to the target role.
+
+Return ONLY valid JSON in exactly this structure:
+
+{{
+    "skill_gaps": [
+        "Skill 1",
+        "Skill 2"
+    ],
+    "hiring_signals": [
+        "Hiring signal 1",
+        "Hiring signal 2"
+    ],
+    "portfolio_ideas": [
+        {{
+            "title": "Project title",
+            "description": "Detailed project description"
+        }}
+    ]
+}}
+
+Make the recommendations specific, realistic, and useful for an internship or entry-level job.
+Do not include Markdown or code fences.
+"""
+
+    try:
+        # Generate analysis using Gemini
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json"
             }
+        )
+
+        raw_text = (response.text or "").strip()
+
+        if not raw_text:
+            return jsonify({
+                "error": "Gemini returned an empty response."
+            }), 502
+
+        # Parse Gemini JSON response
+        result = json.loads(raw_text)
+
+        skill_gaps = result.get("skill_gaps", [])
+        hiring_signals = result.get("hiring_signals", [])
+        portfolio_ideas = result.get("portfolio_ideas", [])
+
+        # Validate response structure
+        if not isinstance(skill_gaps, list):
+            skill_gaps = []
+
+        if not isinstance(hiring_signals, list):
+            hiring_signals = []
+
+        if not isinstance(portfolio_ideas, list):
+            portfolio_ideas = []
+
+        portfolio_ideas = [
+            {
+                "title": str(item.get("title", "Untitled Project")),
+                "description": str(item.get("description", ""))
+            }
+            for item in portfolio_ideas
+            if isinstance(item, dict)
         ]
 
-    })
+        return jsonify({
+            "mode": "gemini",
+            "target_role": role,
+            "skill_gaps": skill_gaps,
+            "hiring_signals": hiring_signals,
+            "portfolio_ideas": portfolio_ideas
+        }), 200
 
+    except json.JSONDecodeError:
+        logging.exception("Gemini returned invalid JSON")
+
+        return jsonify({
+            "error": "Gemini returned an invalid response. Please try again."
+        }), 502
+
+    except Exception:
+        logging.exception("AI Analyzer failed")
+
+        return jsonify({
+            "error": "AI analysis failed. Please try again later."
+        }), 502
 
 # ==================================================
 # ROADMAP API
 # ==================================================
 
+
 @app.post("/api/roadmap")
+@login_required
 def generate_roadmap():
 
     data = request.get_json(silent=True) or {}
 
-    role = data.get(
-        "target_role",
-        "Software Developer"
-    )
+    # Get user information
+    skills = data.get("skills", "")
+    role = data.get("target_role", "Software Developer")
+    experience = data.get("experience", "Beginner")
+    job_description = data.get("job_description", "")
+
+    # Validate duration
+    try:
+        weeks_count = int(data.get("duration_weeks", 4))
+        hours_per_day = float(data.get("hours_per_day", 2))
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "Please provide valid duration and daily study hours."
+        }), 400
+
+    if weeks_count < 1 or weeks_count > MAX_ROADMAP_WEEKS:
+        return jsonify({
+            "error": f"Duration must be between 1 and {MAX_ROADMAP_WEEKS} weeks."
+        }), 400
+
+    if hours_per_day <= 0 or hours_per_day > 24:
+        return jsonify({
+            "error": "Daily study hours must be between 0 and 24."
+        }), 400
+
+    # Check Gemini configuration
+    if not client:
+        return jsonify({
+            "error": "Gemini API is not configured. Check GEMINI_API_KEY."
+        }), 503
+
+    # Format skills
+    if isinstance(skills, list):
+        skills_text = ", ".join(str(skill) for skill in skills)
+    else:
+        skills_text = str(skills)
+
+    prompt = f"""
+You are an expert technical career mentor and learning roadmap designer.
+
+Create a highly personalized learning roadmap for this candidate.
+
+CANDIDATE INFORMATION:
+
+Target Job Role: {role}
+
+Current Skills: {skills_text}
+
+Experience Level: {experience}
+
+Available Study Time: {hours_per_day} hours per day
+
+Roadmap Duration: {weeks_count} weeks
+
+Job Description:
+{job_description if job_description else "No job description provided."}
+
+YOUR TASK:
+
+Create a practical, industry-oriented learning roadmap.
+
+Requirements:
+
+1. Generate EXACTLY {weeks_count} weeks.
+2. Arrange topics from fundamentals to advanced concepts.
+3. Consider the candidate's existing skills.
+4. Focus on skills required for the target job role.
+5. Divide learning according to the available daily study time.
+6. Include practical coding exercises and implementation tasks.
+7. Include one meaningful mini-project for every week.
+8. Make the final weeks focus on interview preparation,
+   deployment, documentation, and practical application where relevant.
+9. Avoid generic or repetitive tasks.
+10. Recommend genuine learning resources with valid HTTP or HTTPS URLs.
+11. Prefer official documentation and reputable learning platforms.
+
+RETURN ONLY VALID JSON using this exact structure:
+
+{{
+    "mode": "gemini",
+    "title": "Personalized Learning Roadmap",
+    "duration_weeks": {weeks_count},
+    "weeks": [
+        {{
+            "week": 1,
+            "title": "Week title",
+            "goal": "What the candidate should achieve",
+            "topics": [
+                "Topic 1",
+                "Topic 2"
+            ],
+            "tasks": [
+                "Complete practical exercise 1",
+                "Build a small application"
+            ],
+            "mini_project": "A practical weekly project",
+            "outcome": "Expected skills and results",
+            "resources": [
+                {{
+                    "name": "Official Documentation",
+                    "url": "https://developer.mozilla.org/"
+                }}
+            ]
+        }}
+    ]
+}}
+
+IMPORTANT:
+- Return exactly {weeks_count} week objects.
+- Every week must contain all the specified fields.
+- Tasks must be strings, not objects.
+- Resources must contain name and URL.
+- Return JSON only. Do not use Markdown code fences.
+"""
 
     try:
 
-        weeks_count = int(
-            data.get("duration_weeks", 4)
+        # Generate roadmap using Gemini
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json",
+                "temperature": 0.7,
+                "max_output_tokens": ROADMAP_MAX_OUTPUT_TOKENS
+            }
         )
 
-    except (TypeError, ValueError):
+        raw_text = (response.text or "").strip()
+
+        if not raw_text:
+            raise ValueError("Gemini returned an empty response.")
+
+        # Parse Gemini response
+        result = json.loads(raw_text)
+
+        weeks = result.get("weeks", [])
+
+        if not isinstance(weeks, list) or len(weeks) != weeks_count:
+            raise ValueError("Gemini returned an incomplete roadmap.")
+
+        # Validate and normalize weekly structure
+        cleaned_weeks = []
+
+        for index, week in enumerate(weeks):
+
+            if not isinstance(week, dict):
+                raise ValueError("Invalid weekly roadmap structure.")
+
+            tasks = week.get("tasks", [])
+            topics = week.get("topics", [])
+            resources = week.get("resources", [])
+
+            if not isinstance(tasks, list):
+                tasks = []
+
+            if not isinstance(topics, list):
+                topics = []
+
+            if not isinstance(resources, list):
+                resources = []
+
+            cleaned_resources = []
+
+            for resource in resources:
+                if not isinstance(resource, dict):
+                    continue
+
+                name = str(resource.get("name", "")).strip()
+                url = str(resource.get("url", "")).strip()
+
+                if name and url.startswith(("http://", "https://")):
+                    cleaned_resources.append({
+                        "name": name,
+                        "url": url
+                    })
+
+            cleaned_weeks.append({
+                "week": index + 1,
+                "title": str(
+                    week.get("title", f"Week {index + 1}")
+                ),
+                "goal": str(week.get("goal", "")),
+                "topics": [
+                    str(topic).strip()
+                    for topic in topics
+                    if str(topic).strip()
+                ],
+                "tasks": [
+                    str(task).strip()
+                    for task in tasks
+                    if isinstance(task, str) and task.strip()
+                ],
+                "mini_project": str(week.get("mini_project", "")),
+                "outcome": str(week.get("outcome", "")),
+                "resources": cleaned_resources
+            })
+
+        # Ensure every week has practical tasks
+        if any(not week["tasks"] for week in cleaned_weeks):
+            raise ValueError("Some roadmap weeks have no tasks.")
 
         return jsonify({
-            "error": "Duration must be a valid number."
+            "mode": "gemini",
+            "title": result.get(
+                "title",
+                f"Learning Roadmap for {role}"
+            ),
+            "target_role": role,
+            "duration_weeks": weeks_count,
+            "weeks": cleaned_weeks
+        }), 200
+
+    except json.JSONDecodeError:
+
+        logging.exception("Gemini returned invalid roadmap JSON")
+
+        return jsonify({
+            "error": "Gemini returned an invalid roadmap. Please try again."
+        }), 502
+
+    except Exception:
+
+        logging.exception("AI roadmap generation failed")
+
+        return jsonify({
+            "error": "AI roadmap generation failed. Check the backend logs."
+        }), 502
+
+
+@app.get("/api/roadmap/progress")
+@login_required
+def get_roadmap_progress():
+    db = DatabaseConnection()
+
+    try:
+        user_id = session["user_id"]
+
+        rows = db.execute(
+            """
+            SELECT task_id, completed
+            FROM roadmap_tasks
+            WHERE user_id = ?
+            """,
+            (user_id,)
+        ).fetchall()
+
+        return jsonify({
+            "tasks": [
+                {
+                    "task_id": row["task_id"],
+                    "completed": bool(row["completed"])
+                }
+                for row in rows
+            ]
+        }), 200
+
+    except Exception:
+        logging.exception("Could not load roadmap progress")
+        return jsonify({
+            "error": "Could not load roadmap progress."
+        }), 500
+
+    finally:
+        db.close()
+
+
+@app.post("/api/roadmap/progress")
+@login_required
+def save_roadmap_progress():
+    data = request.get_json(silent=True) or {}
+
+    task_id = data.get("task_id")
+    task_text = data.get("task_text")
+    week_number = data.get("week_number")
+    completed = data.get("completed")
+
+    if not task_id or not task_text or week_number is None:
+        return jsonify({
+            "error": "Task ID, task text, and week number are required."
         }), 400
 
-    weeks_count = max(
-        1,
-        min(weeks_count, MAX_ROADMAP_WEEKS)
-    )
+    if not isinstance(completed, bool):
+        return jsonify({
+            "error": "Completed must be true or false."
+        }), 400
 
-    return jsonify({
+    try:
+        week_number = int(week_number)
+    except (TypeError, ValueError):
+        return jsonify({
+            "error": "Invalid week number."
+        }), 400
 
-        "mode": "demo",
+    if week_number < 1 or len(str(task_id)) > 255:
+        return jsonify({
+            "error": "Invalid task information."
+        }), 400
 
-        "title": f"Learning Roadmap for {role}",
+    db = DatabaseConnection()
 
-        "duration_weeks": weeks_count,
+    try:
+        user_id = session["user_id"]
 
-        "weeks": [
+        db.execute(
+            """
+            INSERT INTO roadmap_tasks
+                (user_id, task_id, task_text, week_number,
+                 completed, completed_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (user_id, task_id)
+            DO UPDATE SET
+                task_text = EXCLUDED.task_text,
+                week_number = EXCLUDED.week_number,
+                completed = EXCLUDED.completed,
+                completed_at = EXCLUDED.completed_at
+            """,
+            (
+                user_id,
+                str(task_id),
+                str(task_text),
+                week_number,
+                int(completed),
+                datetime.now(timezone.utc).isoformat()
+                if completed else None
+            )
+        )
 
-            {
+        db.commit()
 
-                "week": i,
+        return jsonify({
+            "success": True,
+            "task_id": str(task_id),
+            "completed": completed
+        }), 200
 
-                "title": f"Week {i} Core Milestone",
+    except Exception:
+        db.rollback()
+        logging.exception("Could not save roadmap task progress")
 
-                "goal": "Build practical competencies.",
+        return jsonify({
+            "error": "Could not save task progress."
+        }), 500
 
-                "topics": [
-                    "Basics",
-                    "Implementation"
-                ],
+    finally:
+        db.close()
 
-                "tasks": [
-                    f"Complete exercise {i}.1",
-                    f"Commit code to GitHub for week {i}"
-                ],
 
-                "mini_project": f"Project milestone {i}",
+@app.post("/api/roadmap/progress/sync")
+@login_required
+def sync_roadmap_progress():
+    data = request.get_json(silent=True) or {}
+    tasks = data.get("tasks", [])
 
-                "resources": [
-                    {
-                        "name": "Official Docs",
-                        "url": "https://developer.mozilla.org"
-                    }
-                ]
+    if not isinstance(tasks, list):
+        return jsonify({
+            "error": "Tasks must be a list."
+        }), 400
 
-            }
+    db = DatabaseConnection()
 
-            for i in range(1, weeks_count + 1)
+    try:
+        user_id = session["user_id"]
 
-        ]
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
 
-    })
+            task_id = task.get("task_id")
+            task_text = task.get("task_text")
+            week_number = task.get("week_number")
+            completed = task.get("completed", False)
+
+            if not task_id or not task_text or week_number is None:
+                continue
+
+            if not isinstance(completed, bool):
+                continue
+
+            try:
+                week_number = int(week_number)
+            except (TypeError, ValueError):
+                continue
+
+            if week_number < 1 or len(str(task_id)) > 255:
+                continue
+
+            db.execute(
+                """
+                INSERT INTO roadmap_tasks
+                    (user_id, task_id, task_text, week_number,
+                     completed, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (user_id, task_id)
+                DO UPDATE SET
+                    task_text = EXCLUDED.task_text,
+                    week_number = EXCLUDED.week_number,
+                    completed = EXCLUDED.completed,
+                    completed_at = EXCLUDED.completed_at
+                """,
+                (
+                    user_id,
+                    str(task_id),
+                    str(task_text),
+                    week_number,
+                    int(completed),
+                    datetime.now(timezone.utc).isoformat()
+                    if completed else None
+                )
+            )
+
+        db.commit()
+
+        return jsonify({
+            "success": True,
+            "message": "Roadmap progress synchronized."
+        }), 200
+
+    except Exception:
+        db.rollback()
+        logging.exception("Could not synchronize roadmap progress")
+
+        return jsonify({
+            "error": "Could not synchronize roadmap progress."
+        }), 500
+
+    finally:
+        db.close()
 
 
 # ==================================================
