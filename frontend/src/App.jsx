@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import "./style.css";
 import Profile from "./components/Profile";
 
-const API = "http://localhost:5000";
+const API = import.meta.env.VITE_API_URL || "http://localhost:5000";
 
 const defaultSkills = "Python, SQL, basic HTML/CSS";
 
@@ -121,6 +121,38 @@ async function fetchSavedProgress() {
   });
 
   return saved;
+}
+
+// Shared helper for authentication POST requests.
+// Always sends credentials, parses JSON safely, and handles network failures.
+async function postAuth(path, body) {
+  try {
+    const response = await fetch(`${API}${path}`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const data = await response.json().catch(() => ({}));
+
+    return {
+      ok: response.ok,
+      status: response.status,
+      data: data && typeof data === "object" ? data : {},
+    };
+  } catch (err) {
+    console.error("Auth network error:", err);
+    return {
+      ok: false,
+      status: 0,
+      data: {
+        error: "Unable to connect to the server. Check your connection and try again.",
+      },
+    };
+  }
 }
 
 function App() {
@@ -448,64 +480,90 @@ function App() {
     }
   }
 
+  // Returns { success: true } on login, { verificationRequired: true, email }
+  // when the account is unverified, or { success: false } on other errors.
   async function handleLogin(email, password) {
     setAuthError("");
 
-    try {
-      const response = await fetch(`${API}/api/auth/login`, {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ email, password }),
-      });
+    const result = await postAuth("/api/auth/login", { email, password });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Login failed.");
-      }
-
-      setCurrentUser(data.user);
+    if (result.ok) {
+      setCurrentUser(result.data.user);
       setActiveTab("dashboard");
-
-      return true;
-    } catch (err) {
-      setAuthError(err.message || "Unable to log in.");
-      return false;
+      return { success: true };
     }
+
+    if (result.status === 403 && result.data.verification_required === true) {
+      return { success: false, verificationRequired: true, email };
+    }
+
+    setAuthError(result.data.error || "Login failed.");
+    return { success: false };
   }
 
-  async function handleRegister(name, email, password, role) {
+  // Returns { success: true, email } when the account was created and
+  // a verification code was sent. The user cannot enter the dashboard yet.
+  async function handleRegister(name, email, password, accountRole) {
     setAuthError("");
 
-    try {
-      const response = await fetch(`${API}/api/auth/register`, {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          name,
-          email,
-          password,
-          role,
-        }),
-      });
+    const result = await postAuth("/api/auth/register", {
+      name,
+      email,
+      password,
+      role: accountRole,
+    });
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "Registration failed.");
-      }
-
-      return true;
-    } catch (err) {
-      setAuthError(err.message || "Unable to register.");
-      return false;
+    if (result.ok) {
+      return { success: true, email };
     }
+
+    setAuthError(result.data.error || "Registration failed.");
+    return { success: false };
+  }
+
+  // Returns { success, message } for the OTP verification screen.
+  async function handleVerifyEmail(email, otp) {
+    const result = await postAuth("/api/auth/verify-email", { email, otp });
+
+    if (result.ok) {
+      return {
+        success: true,
+        message: result.data.message || "Email verified successfully.",
+      };
+    }
+
+    return {
+      success: false,
+      message: result.data.error || "Verification failed. Please try again.",
+    };
+  }
+
+  // Returns { success, message, retryAfter } where retryAfter is the
+  // cooldown in seconds if the backend asks the user to wait.
+  async function handleResendOtp(email) {
+    const result = await postAuth("/api/auth/resend-otp", { email });
+
+    if (result.ok) {
+      return {
+        success: true,
+        message:
+          result.data.message ||
+          "A new verification code has been sent to your email.",
+        retryAfter: Number(result.data.retry_after) || undefined,
+      };
+    }
+
+    const retryAfter =
+      result.status === 429
+        ? Number(result.data.retry_after) || 60
+        : undefined;
+
+    return {
+      success: false,
+      message:
+        result.data.error || "Could not resend the verification code.",
+      retryAfter,
+    };
   }
 
   async function handleLogout() {
@@ -574,6 +632,8 @@ function App() {
       <AuthScreen
         onLogin={handleLogin}
         onRegister={handleRegister}
+        onVerifyEmail={handleVerifyEmail}
+        onResendOtp={handleResendOtp}
         error={authError}
       />
     );
@@ -790,7 +850,13 @@ function App() {
   );
 }
 
-function AuthScreen({ onLogin, onRegister, error }) {
+function AuthScreen({
+  onLogin,
+  onRegister,
+  onVerifyEmail,
+  onResendOtp,
+  error,
+}) {
   const [mode, setMode] = useState("login");
   const [role, setRole] = useState("job_seeker");
 
@@ -798,35 +864,130 @@ function AuthScreen({ onLogin, onRegister, error }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
+  const [otp, setOtp] = useState("");
+  const [verifyEmail, setVerifyEmail] = useState("");
+  const [resendCooldown, setResendCooldown] = useState(0);
+
   const [submitting, setSubmitting] = useState(false);
   const [message, setMessage] = useState("");
+  const [localError, setLocalError] = useState("");
+
+  const displayError = localError || error;
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return undefined;
+
+    const timer = setTimeout(() => {
+      setResendCooldown((seconds) => seconds - 1);
+    }, 1000);
+
+    return () => clearTimeout(timer);
+  }, [resendCooldown]);
+
+  function switchMode(nextMode) {
+    setMode(nextMode);
+    setMessage("");
+    setLocalError("");
+  }
 
   async function handleSubmit(event) {
     event.preventDefault();
 
+    if (submitting) return;
+
     setSubmitting(true);
     setMessage("");
+    setLocalError("");
 
     try {
       if (mode === "register") {
-        const success = await onRegister(name, email, password, role);
+        const result = await onRegister(name, email, password, role);
 
-        if (success) {
+        if (result?.success) {
+          setVerifyEmail(result.email);
+          setOtp("");
+          setPassword("");
+          setResendCooldown(60);
+          setMode("verify");
           setMessage(
             role === "recruiter"
-              ? "Registration successful! Your recruiter account is pending verification by the owner. Please log in once approved."
-              : "Registration successful! Please log in with your new account."
+              ? "Registration successful! We sent a 6-digit verification code to your email. After verifying, your recruiter account will be pending approval by the owner."
+              : "Registration successful! Check your email for a 6-digit verification code."
           );
-
-          setMode("login");
-          setPassword("");
         }
       } else {
-        await onLogin(email, password);
+        const result = await onLogin(email, password);
+
+        if (result?.verificationRequired) {
+          setVerifyEmail(result.email);
+          setOtp("");
+          setPassword("");
+          setMode("verify");
+          setMessage(
+            "Your email is not verified yet. Enter the 6-digit code we sent to your email, or request a new one."
+          );
+        }
       }
     } finally {
       setSubmitting(false);
     }
+  }
+
+  async function handleVerify(event) {
+    event.preventDefault();
+
+    if (submitting || otp.length !== 6) return;
+
+    setSubmitting(true);
+    setMessage("");
+    setLocalError("");
+
+    try {
+      const result = await onVerifyEmail(verifyEmail, otp);
+
+      if (result.success) {
+        setEmail(verifyEmail);
+        setPassword("");
+        setOtp("");
+        setMode("login");
+        setMessage(
+          "Email verified successfully. Please log in with your email and password."
+        );
+      } else {
+        setLocalError(result.message);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleResend() {
+    if (submitting || resendCooldown > 0) return;
+
+    setSubmitting(true);
+    setMessage("");
+    setLocalError("");
+
+    try {
+      const result = await onResendOtp(verifyEmail);
+
+      if (result.success) {
+        setMessage("A new verification code has been sent to your email.");
+        setResendCooldown(result.retryAfter || 60);
+      } else {
+        setLocalError(result.message);
+        if (result.retryAfter) {
+          setResendCooldown(result.retryAfter);
+        }
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function handleOtpChange(event) {
+    const digitsOnly = event.target.value.replace(/\D/g, "").slice(0, 6);
+    setOtp(digitsOnly);
   }
 
   return (
@@ -845,101 +1006,157 @@ function AuthScreen({ onLogin, onRegister, error }) {
         </div>
 
         <div className="auth-heading">
-          <h1>{mode === "login" ? "Welcome back." : "Create your account."}</h1>
+          <h1>
+            {mode === "login"
+              ? "Welcome back."
+              : mode === "register"
+              ? "Create your account."
+              : "Verify your email."}
+          </h1>
 
           <p>
             {mode === "login"
               ? "Continue your career journey with CodeBridge AI."
-              : "Start building your skills and career opportunities."}
+              : mode === "register"
+              ? "Start building your skills and career opportunities."
+              : "Enter the 6-digit code sent to your email address."}
           </p>
         </div>
 
-        <div className="auth-tabs">
-          <button
-            type="button"
-            className={mode === "login" ? "selected" : ""}
-            onClick={() => {
-              setMode("login");
-              setMessage("");
-            }}
-          >
-            Login
-          </button>
+        {mode !== "verify" && (
+          <div className="auth-tabs">
+            <button
+              type="button"
+              className={mode === "login" ? "selected" : ""}
+              onClick={() => switchMode("login")}
+            >
+              Login
+            </button>
 
-          <button
-            type="button"
-            className={mode === "register" ? "selected" : ""}
-            onClick={() => {
-              setMode("register");
-              setMessage("");
-            }}
-          >
-            Register
-          </button>
-        </div>
+            <button
+              type="button"
+              className={mode === "register" ? "selected" : ""}
+              onClick={() => switchMode("register")}
+            >
+              Register
+            </button>
+          </div>
+        )}
 
-        <form onSubmit={handleSubmit} className="auth-form">
-          {mode === "register" && (
-            <>
-              <label>
-                Full Name
-                <input
-                  type="text"
-                  placeholder="Enter your full name"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  required
-                />
-              </label>
+        {mode === "verify" ? (
+          <form onSubmit={handleVerify} className="auth-form">
+            <p>
+              Verification code sent to <strong>{verifyEmail}</strong>
+            </p>
 
-              <label>
-                Account Type
-                <select value={role} onChange={(e) => setRole(e.target.value)}>
-                  <option value="job_seeker">Job Seeker</option>
-                  <option value="recruiter">Recruiter</option>
-                </select>
-              </label>
-            </>
-          )}
+            <label>
+              Verification Code
+              <input
+                type="text"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                placeholder="Enter 6-digit code"
+                value={otp}
+                onChange={handleOtpChange}
+                maxLength={6}
+                pattern="[0-9]{6}"
+                required
+              />
+            </label>
 
-          <label>
-            Email Address
-            <input
-              type="email"
-              placeholder="you@example.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-            />
-          </label>
+            {displayError && <div className="auth-error">{displayError}</div>}
+            {message && <div className="auth-success">{message}</div>}
 
-          <label>
-            Password
-            <input
-              type="password"
-              placeholder="Enter your password (min 8 chars)"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              minLength={8}
-              required
-            />
-          </label>
+            <button
+              className="primary-button auth-submit"
+              type="submit"
+              disabled={submitting || otp.length !== 6}
+            >
+              {submitting ? "Please wait..." : "Verify Email"}
+            </button>
 
-          {error && <div className="auth-error">{error}</div>}
-          {message && <div className="auth-success">{message}</div>}
+            <button
+              type="button"
+              className="primary-button"
+              onClick={handleResend}
+              disabled={submitting || resendCooldown > 0}
+            >
+              {resendCooldown > 0
+                ? `Resend Code in ${resendCooldown}s`
+                : "Resend Verification Code"}
+            </button>
 
-          <button
-            className="primary-button auth-submit"
-            type="submit"
-            disabled={submitting}
-          >
-            {submitting
-              ? "Please wait..."
-              : mode === "login"
-              ? "Login to CodeBridge AI →"
-              : "Create Account →"}
-          </button>
-        </form>
+            <button type="button" onClick={() => switchMode("login")}>
+              Back to Login
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={handleSubmit} className="auth-form">
+            {mode === "register" && (
+              <>
+                <label>
+                  Full Name
+                  <input
+                    type="text"
+                    placeholder="Enter your full name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    required
+                  />
+                </label>
+
+                <label>
+                  Account Type
+                  <select
+                    value={role}
+                    onChange={(e) => setRole(e.target.value)}
+                  >
+                    <option value="job_seeker">Job Seeker</option>
+                    <option value="recruiter">Recruiter</option>
+                  </select>
+                </label>
+              </>
+            )}
+
+            <label>
+              Email Address
+              <input
+                type="email"
+                placeholder="you@example.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                required
+              />
+            </label>
+
+            <label>
+              Password
+              <input
+                type="password"
+                placeholder="Enter your password (min 8 chars)"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                minLength={8}
+                required
+              />
+            </label>
+
+            {displayError && <div className="auth-error">{displayError}</div>}
+            {message && <div className="auth-success">{message}</div>}
+
+            <button
+              className="primary-button auth-submit"
+              type="submit"
+              disabled={submitting}
+            >
+              {submitting
+                ? "Please wait..."
+                : mode === "login"
+                ? "Login to CodeBridge AI →"
+                : "Create Account →"}
+            </button>
+          </form>
+        )}
 
         <div className="auth-footer">
           <span>Secure career workspace</span>
@@ -1042,10 +1259,10 @@ function RecruiterHub({ currentUser, onJobsUpdated }) {
       <div className="panel empty-state" style={{ textAlign: "left", padding: "2rem" }}>
         <h2>Recruiter Account Pending Verification</h2>
         <p style={{ marginTop: "1rem", lineHeight: "1.6" }}>
-          Your account status is currently <strong>{currentUser.recruiter_status}</strong>. 
+          Your account status is currently <strong>{currentUser.recruiter_status}</strong>.
           The platform owner must verify your account before you can post job and internship opportunities.
         </p>
-        
+
         <div style={{ marginTop: "1.5rem", padding: "1rem", background: "rgba(255,255,255,0.03)", borderRadius: "8px" }}>
           <h4>Notify Owner Instantly</h4>
           <p style={{ fontSize: "0.9rem", margin: "0.5rem 0 1rem", opacity: 0.85 }}>

@@ -1,23 +1,28 @@
+
 import os
 import re
-import json
-import time
 import ssl
+import secrets
 import logging
-import sqlite3
-from functools import wraps
 import smtplib
-from email.message import EmailMessage
 
-from datetime import date, timedelta
+from functools import wraps
+from email.message import EmailMessage
+from datetime import date, datetime, timedelta, timezone
+
+import psycopg
+from psycopg.rows import dict_row
+
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from dotenv import load_dotenv
-from werkzeug.security import generate_password_hash, check_password_hash
+
+from werkzeug.security import (
+    generate_password_hash,
+    check_password_hash
+)
 
 from google import genai
-from google.genai import types
-from google.genai.errors import ServerError, ClientError
 
 
 # ==================================================
@@ -28,14 +33,21 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-DATABASE_PATH = os.path.join(BASE_DIR, "codebridge.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing from environment variables.")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 FRONTEND_URL = os.getenv(
     "FRONTEND_URL",
     "http://localhost:5173"
+).rstrip("/")
+
+IS_PRODUCTION = (
+    os.getenv("SESSION_COOKIE_SECURE", "False").lower() == "true"
 )
 
 app = Flask(__name__)
@@ -43,39 +55,46 @@ app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.getenv("FLASK_SECRET_KEY"),
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.getenv(
-        "SESSION_COOKIE_SECURE",
-        "False"
-    ).lower() == "true",
+    SESSION_COOKIE_SAMESITE=os.getenv(
+        "SESSION_COOKIE_SAMESITE", "Lax"
+    ),
+    SESSION_COOKIE_SECURE=IS_PRODUCTION,
     SESSION_COOKIE_NAME="codebridge_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=7)
 )
 
 if not app.config["SECRET_KEY"]:
     raise RuntimeError(
-        "FLASK_SECRET_KEY is missing from backend/.env"
+        "FLASK_SECRET_KEY is missing from environment variables."
     )
+
+
+# ==================================================
+# CORS
+# ==================================================
+
+allowed_origins = [
+    FRONTEND_URL,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
+]
 
 CORS(
     app,
-    resources={
-        r"/api/*": {
-            "origins": [
-                FRONTEND_URL,
-                "http://localhost:5173",
-                "http://127.0.0.1:5173",
-            ]
-        }
-    },
-    supports_credentials=True,
+    resources={r"/api/*": {"origins": allowed_origins}},
+    supports_credentials=True
 )
 
 app.logger.setLevel(logging.INFO)
 
+
+# ==================================================
+# GEMINI
+# ==================================================
+
 client = (
     genai.Client(api_key=GEMINI_API_KEY)
-    if GEMINI_API_KEY
-    else None
+    if GEMINI_API_KEY else None
 )
 
 MAX_ATTEMPTS = 2
@@ -85,107 +104,438 @@ MAX_ROADMAP_WEEKS = 12
 
 
 # ==================================================
-# DATABASE
+# EMAIL VERIFICATION SETTINGS
 # ==================================================
 
+OTP_EXPIRY_MINUTES = 5
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_SECONDS = 60
+
+EMAIL_REGEX = re.compile(
+    r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+)
+
+
+# ==================================================
+# DATABASE - NEON POSTGRESQL
+# ==================================================
+
+class DatabaseConnection:
+
+    def __init__(self):
+
+        self.connection = psycopg.connect(
+            DATABASE_URL,
+            row_factory=dict_row,
+            connect_timeout=15
+        )
+
+    def execute(self, query, parameters=()):
+
+        query = query.replace("?", "%s")
+
+        return self.connection.execute(
+            query,
+            parameters
+        )
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
+
 def get_db():
-    connection = sqlite3.connect(DATABASE_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+    return DatabaseConnection()
 
 
 def init_db():
+
     connection = get_db()
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            role TEXT NOT NULL CHECK (
-                role IN ('job_seeker', 'recruiter', 'admin')
-            ),
-            recruiter_status TEXT DEFAULT 'not_applicable',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    try:
+
+        # USERS TABLE
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+
+                name TEXT NOT NULL,
+
+                email TEXT NOT NULL UNIQUE,
+
+                password_hash TEXT NOT NULL,
+
+                role TEXT NOT NULL CHECK (
+                    role IN ('job_seeker', 'recruiter', 'admin')
+                ),
+
+                recruiter_status TEXT DEFAULT 'not_applicable',
+
+                email_verified BOOLEAN NOT NULL DEFAULT TRUE,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Add the column safely to existing Neon databases.
+        # Existing accounts remain verified.
+
+        connection.execute("""
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS email_verified
+            BOOLEAN NOT NULL DEFAULT TRUE
+        """)
+
+        # EMAIL OTP TABLE
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS email_verifications (
+
+                user_id BIGINT PRIMARY KEY,
+
+                otp_hash TEXT NOT NULL,
+
+                expires_at TIMESTAMPTZ NOT NULL,
+
+                attempts INTEGER NOT NULL DEFAULT 0,
+
+                last_sent_at TIMESTAMPTZ NOT NULL,
+
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        # JOBS TABLE
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+
+                recruiter_id BIGINT,
+
+                title TEXT NOT NULL,
+
+                company TEXT NOT NULL,
+
+                type TEXT NOT NULL,
+
+                level TEXT NOT NULL,
+
+                location TEXT,
+
+                salary TEXT,
+
+                description TEXT,
+
+                skills TEXT,
+
+                status TEXT DEFAULT 'pending',
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                FOREIGN KEY (recruiter_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        # ROADMAP TASKS TABLE
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS roadmap_tasks (
+
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+
+                user_id BIGINT NOT NULL,
+
+                task_id TEXT NOT NULL,
+
+                task_text TEXT NOT NULL,
+
+                week_number INTEGER NOT NULL,
+
+                completed INTEGER NOT NULL DEFAULT 0,
+
+                completed_at TEXT,
+
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                UNIQUE(user_id, task_id),
+
+                FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        # PROFILE VISITS TABLE
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS profile_visits (
+
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+
+                user_id BIGINT NOT NULL,
+
+                visit_date TEXT NOT NULL,
+
+                UNIQUE(user_id, visit_date),
+
+                FOREIGN KEY (user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        connection.commit()
+
+        app.logger.info(
+            "Neon PostgreSQL database initialized successfully."
         )
-    """)
+
+    except Exception:
+
+        connection.rollback()
+
+        app.logger.exception(
+            "Database initialization failed."
+        )
+
+        raise
+
+    finally:
+
+        connection.close()
+
+
+# ==================================================
+# EMAIL SENDING FUNCTION
+# ==================================================
+
+def send_email(to_email, subject, body):
+
+    smtp_host = os.getenv(
+        "SMTP_HOST",
+        "smtp.gmail.com"
+    )
+
+    smtp_port = int(
+        os.getenv("SMTP_PORT", 587)
+    )
+
+    smtp_user = os.getenv("SMTP_USER", "")
+
+    smtp_pass = os.getenv("SMTP_PASS", "")
+
+    if not smtp_user or not smtp_pass:
+
+        raise RuntimeError(
+            "SMTP credentials are not configured."
+        )
+
+    message = EmailMessage()
+
+    message["Subject"] = subject
+
+    message["From"] = smtp_user
+
+    message["To"] = to_email
+
+    message.set_content(body)
+
+    with smtplib.SMTP(
+        smtp_host,
+        smtp_port,
+        timeout=30
+    ) as server:
+
+        server.ehlo()
+
+        server.starttls(
+            context=ssl.create_default_context()
+        )
+
+        server.ehlo()
+
+        server.login(
+            smtp_user,
+            smtp_pass
+        )
+
+        server.send_message(message)
+
+
+# ==================================================
+# GENERATE AND STORE OTP
+# ==================================================
+
+def create_email_otp(connection, user_id):
+
+    otp = f"{secrets.randbelow(1000000):06d}"
+
+    otp_hash = generate_password_hash(otp)
+
+    now = datetime.now(timezone.utc)
+
+    expires_at = now + timedelta(
+        minutes=OTP_EXPIRY_MINUTES
+    )
 
     connection.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recruiter_id INTEGER,
-            title TEXT NOT NULL,
-            company TEXT NOT NULL,
-            type TEXT NOT NULL,
-            level TEXT NOT NULL,
-            location TEXT,
-            salary TEXT,
-            description TEXT,
-            skills TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (recruiter_id) REFERENCES users(id) ON DELETE CASCADE
+        INSERT INTO email_verifications (
+            user_id,
+            otp_hash,
+            expires_at,
+            attempts,
+            last_sent_at
         )
-    """)
+        VALUES (?, ?, ?, 0, ?)
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS roadmap_tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            task_id TEXT NOT NULL,
-            task_text TEXT NOT NULL,
-            week_number INTEGER NOT NULL,
-            completed INTEGER NOT NULL DEFAULT 0,
-            completed_at TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(user_id, task_id),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
+        ON CONFLICT (user_id)
+        DO UPDATE SET
+            otp_hash = EXCLUDED.otp_hash,
+            expires_at = EXCLUDED.expires_at,
+            attempts = 0,
+            last_sent_at = EXCLUDED.last_sent_at
+    """, (
+        user_id,
+        otp_hash,
+        expires_at,
+        now
+    ))
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS profile_visits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            visit_date TEXT NOT NULL,
-            UNIQUE(user_id, visit_date),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        )
-    """)
-    
-    connection.commit()
-    connection.close()
-    app.logger.info("Database initialized.")
+    return otp
 
+
+def send_verification_otp(user, otp):
+
+    subject = "Verify your CodeBridge AI email"
+
+    body = f"""
+Hello {user['name']},
+
+Welcome to CodeBridge AI!
+
+Your email verification code is:
+
+{otp}
+
+This code will expire in {OTP_EXPIRY_MINUTES} minutes.
+
+Do not share this code with anyone.
+
+If you did not create this account, you can ignore this email.
+
+Regards,
+CodeBridge AI Team
+"""
+
+    send_email(
+        user["email"],
+        subject,
+        body
+    )
+
+
+# ==================================================
+# CREATE OWNER ADMIN ACCOUNT
+# ==================================================
 
 def create_owner_admin():
-    owner_email = os.getenv("OWNER_EMAIL", "").strip().lower()
-    owner_password = os.getenv("OWNER_PASSWORD", "")
+
+    owner_email = os.getenv(
+        "OWNER_EMAIL",
+        ""
+    ).strip().lower()
+
+    owner_password = os.getenv(
+        "OWNER_PASSWORD",
+        ""
+    )
 
     if not owner_email or not owner_password:
+
+        app.logger.warning(
+            "Owner admin credentials are not configured."
+        )
+
         return
 
     connection = get_db()
+
     try:
+
         existing_admin = connection.execute(
             "SELECT id FROM users WHERE email = ?",
             (owner_email,)
         ).fetchone()
 
         if existing_admin:
+
+            app.logger.info(
+                "Owner admin account already exists."
+            )
+
             return
 
-        password_hash = generate_password_hash(owner_password)
+        password_hash = generate_password_hash(
+            owner_password
+        )
+
         connection.execute("""
-            INSERT INTO users (name, email, password_hash, role, recruiter_status)
-            VALUES (?, ?, ?, 'admin', 'not_applicable')
-        """, ("CodeBridge Owner", owner_email, password_hash))
+            INSERT INTO users (
+                name,
+                email,
+                password_hash,
+                role,
+                recruiter_status,
+                email_verified
+            )
+            VALUES (
+                ?,
+                ?,
+                ?,
+                'admin',
+                'not_applicable',
+                TRUE
+            )
+            ON CONFLICT (email) DO NOTHING
+        """, (
+            "CodeBridge Owner",
+            owner_email,
+            password_hash
+        ))
+
         connection.commit()
-        app.logger.info("Private owner Admin account created.")
-    except sqlite3.Error:
+
+        app.logger.info(
+            "Owner admin account checked/created."
+        )
+
+    except psycopg.Error:
+
         connection.rollback()
+
+        app.logger.exception(
+            "Could not create owner admin."
+        )
+
+        raise
+
     finally:
+
         connection.close()
 
 
@@ -194,34 +544,56 @@ def create_owner_admin():
 # ==================================================
 
 def login_required(view_function):
+
     @wraps(view_function)
     def wrapper(*args, **kwargs):
+
         if not session.get("user_id"):
-            return jsonify({"error": "Please log in first."}), 401
+
+            return jsonify({
+                "error": "Please log in first."
+            }), 401
+
         return view_function(*args, **kwargs)
+
     return wrapper
 
 
 def role_required(*allowed_roles):
+
     def decorator(view_function):
+
         @wraps(view_function)
         def wrapper(*args, **kwargs):
+
             if not session.get("user_id"):
-                return jsonify({"error": "Please log in first."}), 401
+
+                return jsonify({
+                    "error": "Please log in first."
+                }), 401
+
             if session.get("role") not in allowed_roles:
-                return jsonify({"error": "You are not authorized to access this resource."}), 403
+
+                return jsonify({
+                    "error": "You are not authorized to access this resource."
+                }), 403
+
             return view_function(*args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
 def get_public_user(user):
+
     return {
         "id": user["id"],
         "name": user["name"],
         "email": user["email"],
         "role": user["role"],
         "recruiter_status": user["recruiter_status"],
+        "email_verified": user["email_verified"]
     }
 
 
@@ -230,6 +602,7 @@ def get_public_user(user):
 # ==================================================
 
 SAMPLE_JOBS = [
+
     {
         "id": 1,
         "title": "Python Developer Intern",
@@ -240,9 +613,14 @@ SAMPLE_JOBS = [
         "location": "Remote",
         "salary": "Stipend Provided",
         "description": "Build backend automation scripts and REST APIs using Python and Flask.",
-        "skills": ["Python", "Git", "Problem solving"],
+        "skills": [
+            "Python",
+            "Git",
+            "Problem solving"
+        ],
         "source": "Demo data — verify before applying"
     },
+
     {
         "id": 2,
         "title": "Frontend Apprentice",
@@ -253,9 +631,15 @@ SAMPLE_JOBS = [
         "location": "Remote",
         "salary": "Paid Training",
         "description": "Learn modern component-driven development with React and Vite.",
-        "skills": ["HTML", "CSS", "JavaScript", "React"],
+        "skills": [
+            "HTML",
+            "CSS",
+            "JavaScript",
+            "React"
+        ],
         "source": "Demo data — verify before applying"
-    },
+    }
+
 ]
 
 
@@ -265,135 +649,290 @@ SAMPLE_JOBS = [
 
 @app.get("/api/health")
 def health():
-    return jsonify({"status": "ok", "service": "CodeBridge AI API"})
+
+    return jsonify({
+        "status": "ok",
+        "service": "CodeBridge AI API"
+    })
 
 
 @app.get("/api/jobs")
 def get_public_jobs():
-    connection = get_db()
-    try:
-        approved_db_jobs = connection.execute(
-            "SELECT * FROM jobs WHERE status = 'approved' ORDER BY id DESC"
-        ).fetchall()
-        
-        formatted_db_jobs = []
-        for row in approved_db_jobs:
-            j = dict(row)
-            if isinstance(j["skills"], str):
-                j["skills"] = [s.strip() for s in j["skills"].split(",") if s.strip()]
-            formatted_db_jobs.append(j)
 
-        return jsonify({"jobs": SAMPLE_JOBS + formatted_db_jobs})
+    connection = get_db()
+
+    try:
+
+        approved_db_jobs = connection.execute("""
+            SELECT *
+            FROM jobs
+            WHERE status = 'approved'
+            ORDER BY id DESC
+        """).fetchall()
+
+        formatted_db_jobs = []
+
+        for row in approved_db_jobs:
+
+            job = dict(row)
+
+            if isinstance(job["skills"], str):
+
+                job["skills"] = [
+                    skill.strip()
+                    for skill in job["skills"].split(",")
+                    if skill.strip()
+                ]
+
+            formatted_db_jobs.append(job)
+
+        return jsonify({
+            "jobs": SAMPLE_JOBS + formatted_db_jobs
+        })
+
     finally:
+
         connection.close()
 
 
 @app.post("/api/jobs/create")
 @role_required("recruiter")
 def create_job_opportunity():
+
     user_id = session["user_id"]
+
     connection = get_db()
+
     try:
-        user = connection.execute("SELECT recruiter_status FROM users WHERE id = ?", (user_id,)).fetchone()
+
+        user = connection.execute(
+            "SELECT recruiter_status FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
+
         if not user or user["recruiter_status"] != "approved":
-            return jsonify({"error": "Your recruiter account is pending verification by the owner."}), 403
+
+            return jsonify({
+                "error": "Your recruiter account is pending verification by the owner."
+            }), 403
 
         data = request.get_json(silent=True) or {}
+
         title = str(data.get("title", "")).strip()
         company = str(data.get("company", "")).strip()
-        job_type = str(data.get("type", "Internship")).strip()
-        level = str(data.get("level", "Beginner")).strip()
-        location = str(data.get("location", "Remote")).strip()
-        salary = str(data.get("salary", "Stipend Provided")).strip()
-        description = str(data.get("description", "")).strip()
+
+        job_type = str(
+            data.get("type", "Internship")
+        ).strip()
+
+        level = str(
+            data.get("level", "Beginner")
+        ).strip()
+
+        location = str(
+            data.get("location", "Remote")
+        ).strip()
+
+        salary = str(
+            data.get("salary", "Stipend Provided")
+        ).strip()
+
+        description = str(
+            data.get("description", "")
+        ).strip()
+
         skills = data.get("skills", [])
-        
-        skills_str = ", ".join(skills) if isinstance(skills, list) else str(skills)
+
+        skills_str = (
+            ", ".join(skills)
+            if isinstance(skills, list)
+            else str(skills)
+        )
 
         if not title or not company:
-            return jsonify({"error": "Title and company are required."}), 400
+
+            return jsonify({
+                "error": "Title and company are required."
+            }), 400
 
         connection.execute("""
-            INSERT INTO jobs (recruiter_id, title, company, type, level, location, salary, description, skills, status)
+            INSERT INTO jobs (
+                recruiter_id,
+                title,
+                company,
+                type,
+                level,
+                location,
+                salary,
+                description,
+                skills,
+                status
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        """, (user_id, title, company, job_type, level, location, salary, description, skills_str))
+        """, (
+            user_id,
+            title,
+            company,
+            job_type,
+            level,
+            location,
+            salary,
+            description,
+            skills_str
+        ))
+
         connection.commit()
 
-        return jsonify({"message": "Job posted successfully! Pending owner verification."}), 201
+        return jsonify({
+            "message": "Job posted successfully! Pending owner verification."
+        }), 201
+
     finally:
+
         connection.close()
 
 
 @app.get("/api/jobs/recruiter")
 @role_required("recruiter")
 def get_recruiter_jobs():
-    user_id = session["user_id"]
+
     connection = get_db()
+
     try:
-        jobs = connection.execute("SELECT * FROM jobs WHERE recruiter_id = ? ORDER BY id DESC", (user_id,)).fetchall()
-        return jsonify({"jobs": [dict(j) for j in jobs]})
+
+        jobs = connection.execute("""
+            SELECT *
+            FROM jobs
+            WHERE recruiter_id = ?
+            ORDER BY id DESC
+        """, (session["user_id"],)).fetchall()
+
+        return jsonify({
+            "jobs": [dict(job) for job in jobs]
+        })
+
     finally:
+
         connection.close()
 
 
 @app.get("/api/admin/recruiters/pending")
 @role_required("admin")
 def get_pending_recruiters():
+
     connection = get_db()
+
     try:
-        users = connection.execute(
-            "SELECT id, name, email, recruiter_status, created_at FROM users WHERE role = 'recruiter' AND recruiter_status = 'pending'"
-        ).fetchall()
-        return jsonify({"pending_recruiters": [dict(u) for u in users]})
+
+        users = connection.execute("""
+            SELECT
+                id,
+                name,
+                email,
+                recruiter_status,
+                created_at
+            FROM users
+            WHERE role = 'recruiter'
+              AND recruiter_status = 'pending'
+        """).fetchall()
+
+        return jsonify({
+            "pending_recruiters": [
+                dict(user) for user in users
+            ]
+        })
+
     finally:
+
         connection.close()
 
 
 @app.post("/api/admin/recruiters/<int:user_id>/verify")
 @role_required("admin")
 def verify_recruiter(user_id):
+
     data = request.get_json(silent=True) or {}
+
     status = data.get("status")
+
     if status not in ("approved", "rejected"):
-        return jsonify({"error": "Invalid status."}), 400
+
+        return jsonify({
+            "error": "Invalid status."
+        }), 400
 
     connection = get_db()
+
     try:
-        cursor = connection.execute(
-            "UPDATE users SET recruiter_status = ? WHERE id = ? AND role = 'recruiter'",
-            (status, user_id)
-        )
+
+        cursor = connection.execute("""
+            UPDATE users
+            SET recruiter_status = ?
+            WHERE id = ?
+              AND role = 'recruiter'
+        """, (status, user_id))
+
         connection.commit()
+
         if cursor.rowcount == 0:
-            return jsonify({"error": "Recruiter not found."}), 404
-        return jsonify({"message": f"Recruiter {status} successfully."})
+
+            return jsonify({
+                "error": "Recruiter not found."
+            }), 404
+
+        return jsonify({
+            "message": f"Recruiter {status} successfully."
+        })
+
     finally:
+
         connection.close()
 
+
+# ==================================================
+# RECRUITER VERIFICATION EMAIL
+# ==================================================
 
 @app.post("/api/recruiter/request-verification")
 @login_required
 def request_recruiter_verification():
+
     user_id = session.get("user_id")
+
     connection = get_db()
+
     try:
-        user = connection.execute("SELECT name, email, recruiter_status FROM users WHERE id = ?", (user_id,)).fetchone()
+
+        user = connection.execute("""
+            SELECT
+                name,
+                email,
+                recruiter_status
+            FROM users
+            WHERE id = ?
+        """, (user_id,)).fetchone()
+
         if not user:
-            return jsonify({"error": "User not found."}), 404
+
+            return jsonify({
+                "error": "User not found."
+            }), 404
 
         owner_email = os.getenv("OWNER_EMAIL")
-        smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-        smtp_port = int(os.getenv("SMTP_PORT", 587))
-        smtp_user = os.getenv("SMTP_USER", owner_email)
-        smtp_pass = os.getenv("SMTP_PASS", "")
 
-        if not owner_email or not smtp_pass:
-            return jsonify({"error": "Email server credentials not configured on the backend."}), 500
+        if not owner_email:
+
+            return jsonify({
+                "error": "Owner email is not configured."
+            }), 500
 
         msg = EmailMessage()
 
-        msg["Subject"] = f"Recruiter Verification Request - {user['name']}"
-        msg["From"] = smtp_user
+        msg["Subject"] = (
+            f"Recruiter Verification Request - {user['name']}"
+        )
+
+        msg["From"] = os.getenv("SMTP_USER", owner_email)
         msg["To"] = owner_email
 
         msg.set_content(f"""
@@ -401,246 +940,901 @@ Hello CodeBridge AI Owner,
 
 A new recruiter has requested account verification:
 
-- Name: {user['name']}
-- Email: {user['email']}
-- User ID: #{user_id}
-- Current Status: {user['recruiter_status']}
+Name: {user['name']}
+Email: {user['email']}
+User ID: #{user_id}
+Current Status: {user['recruiter_status']}
 
-Please log into your Admin Owner Panel to review and approve/reject this account.
+Please log into your Admin Owner Panel to review this account.
 
 Best regards,
 CodeBridge AI System
 """)
 
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+        smtp_user = os.getenv("SMTP_USER", owner_email)
+        smtp_pass = os.getenv("SMTP_PASS", "")
+
+        if not smtp_pass:
+
+            return jsonify({
+                "error": "Email server credentials are not configured."
+            }), 500
+
+        with smtplib.SMTP(
+            os.getenv("SMTP_HOST", "smtp.gmail.com"),
+            int(os.getenv("SMTP_PORT", 587)),
+            timeout=30
+        ) as server:
+
             server.ehlo()
-            server.starttls(context=ssl.create_default_context())
+
+            server.starttls(
+                context=ssl.create_default_context()
+            )
+
             server.ehlo()
+
             server.login(smtp_user, smtp_pass)
 
-            server.send_message(
-                msg,
-                from_addr=smtp_user,
-                to_addrs=[owner_email]
-            )
+            server.send_message(msg)
 
         return jsonify({
             "message": "Verification request sent successfully to the platform owner!"
         }), 200
-    except Exception as error:
-        app.logger.exception("Failed to send verification email.")
+
+    except Exception:
+
+        app.logger.exception(
+            "Failed to send recruiter verification email."
+        )
 
         return jsonify({
-            "error": f"{type(error).__name__}: {repr(error)}"
+            "error": "Unable to send verification email. Please try again later."
         }), 500
 
     finally:
+
         connection.close()
 
+
 # ==================================================
-# AUTHENTICATION API
+# REGISTER
 # ==================================================
 
 @app.post("/api/auth/register")
 def register():
+
     data = request.get_json(silent=True) or {}
+
     name = str(data.get("name", "")).strip()
-    email = str(data.get("email", "")).strip().lower()
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
     password = str(data.get("password", ""))
-    role = str(data.get("role", "job_seeker")).strip().lower()
+
+    role = str(
+        data.get("role", "job_seeker")
+    ).strip().lower()
 
     if role not in ("job_seeker", "recruiter"):
-        return jsonify({"error": "Invalid role."}), 400
 
-    if not name or not email or not password or len(password) < 8:
-        return jsonify({"error": "Valid name, email, and password (min 8 chars) required."}), 400
+        return jsonify({
+            "error": "Invalid role."
+        }), 400
+
+    if not name or len(name) > 100:
+
+        return jsonify({
+            "error": "Please enter a valid name."
+        }), 400
+
+    if len(email) > 254 or not EMAIL_REGEX.fullmatch(email):
+
+        return jsonify({
+            "error": "Please enter a valid email address."
+        }), 400
+
+    if len(password) < 8:
+
+        return jsonify({
+            "error": "Password must contain at least 8 characters."
+        }), 400
 
     connection = get_db()
+
     try:
-        existing = connection.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+
+        existing = connection.execute(
+            "SELECT id FROM users WHERE email = ?",
+            (email,)
+        ).fetchone()
+
         if existing:
-            return jsonify({"error": "Email already registered."}), 409
+
+            return jsonify({
+                "error": "Email already registered. If your account is not verified, request a new OTP."
+            }), 409
 
         password_hash = generate_password_hash(password)
-        recruiter_status = "pending" if role == "recruiter" else "not_applicable"
 
-        connection.execute("""
-            INSERT INTO users (name, email, password_hash, role, recruiter_status)
-            VALUES (?, ?, ?, ?, ?)
-        """, (name, email, password_hash, role, recruiter_status))
+        recruiter_status = (
+            "pending"
+            if role == "recruiter"
+            else "not_applicable"
+        )
+
+        user = connection.execute("""
+            INSERT INTO users (
+                name,
+                email,
+                password_hash,
+                role,
+                recruiter_status,
+                email_verified
+            )
+            VALUES (?, ?, ?, ?, ?, FALSE)
+            RETURNING id, name, email, role, recruiter_status
+        """, (
+            name,
+            email,
+            password_hash,
+            role,
+            recruiter_status
+        )).fetchone()
+
+        otp = create_email_otp(
+            connection,
+            user["id"]
+        )
+
         connection.commit()
-        return jsonify({"message": "Registration successful."}), 201
+
+        try:
+
+            send_verification_otp(
+                user,
+                otp
+            )
+
+        except Exception:
+
+            app.logger.exception(
+                "OTP email could not be sent."
+            )
+
+            return jsonify({
+                "message": "Your account was created, but the verification email could not be sent. Please use Resend OTP.",
+                "email": email,
+                "verification_required": True
+            }), 201
+
+        return jsonify({
+            "message": "Registration successful. A verification OTP has been sent to your email.",
+            "email": email,
+            "verification_required": True
+        }), 201
+
+    except psycopg.errors.UniqueViolation:
+
+        connection.rollback()
+
+        return jsonify({
+            "error": "Email already registered."
+        }), 409
+
+    except Exception:
+
+        connection.rollback()
+
+        app.logger.exception(
+            "Registration failed."
+        )
+
+        return jsonify({
+            "error": "Registration failed. Please try again."
+        }), 500
+
     finally:
+
         connection.close()
 
+
+# ==================================================
+# VERIFY EMAIL OTP
+# ==================================================
+
+@app.post("/api/auth/verify-email")
+def verify_email():
+
+    data = request.get_json(silent=True) or {}
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
+    otp = str(
+        data.get("otp", "")
+    ).strip()
+
+    if not EMAIL_REGEX.fullmatch(email):
+
+        return jsonify({
+            "error": "Please provide a valid email."
+        }), 400
+
+    if not re.fullmatch(r"\d{6}", otp):
+
+        return jsonify({
+            "error": "Please enter a valid 6-digit OTP."
+        }), 400
+
+    connection = get_db()
+
+    try:
+
+        user = connection.execute("""
+            SELECT id, email_verified
+            FROM users
+            WHERE email = ?
+        """, (email,)).fetchone()
+
+        if not user:
+
+            return jsonify({
+                "error": "Invalid email or OTP."
+            }), 400
+
+        if user["email_verified"]:
+
+            return jsonify({
+                "message": "Email is already verified. You can log in."
+            }), 200
+
+        verification = connection.execute("""
+            SELECT *
+            FROM email_verifications
+            WHERE user_id = ?
+        """, (user["id"],)).fetchone()
+
+        if not verification:
+
+            return jsonify({
+                "error": "OTP not found. Please request a new OTP."
+            }), 400
+
+        if verification["attempts"] >= OTP_MAX_ATTEMPTS:
+
+            return jsonify({
+                "error": "Too many incorrect attempts. Please request a new OTP."
+            }), 429
+
+        now = datetime.now(timezone.utc)
+
+        if verification["expires_at"] <= now:
+
+            connection.execute("""
+                DELETE FROM email_verifications
+                WHERE user_id = ?
+            """, (user["id"],))
+
+            connection.commit()
+
+            return jsonify({
+                "error": "OTP expired. Please request a new OTP."
+            }), 400
+
+        if not check_password_hash(
+            verification["otp_hash"],
+            otp
+        ):
+
+            connection.execute("""
+                UPDATE email_verifications
+                SET attempts = attempts + 1
+                WHERE user_id = ?
+            """, (user["id"],))
+
+            connection.commit()
+
+            return jsonify({
+                "error": "Incorrect OTP."
+            }), 400
+
+        connection.execute("""
+            UPDATE users
+            SET email_verified = TRUE
+            WHERE id = ?
+        """, (user["id"],))
+
+        connection.execute("""
+            DELETE FROM email_verifications
+            WHERE user_id = ?
+        """, (user["id"],))
+
+        connection.commit()
+
+        return jsonify({
+            "message": "Email verified successfully! You can now log in.",
+            "verified": True
+        }), 200
+
+    except Exception:
+
+        connection.rollback()
+
+        app.logger.exception(
+            "Email verification failed."
+        )
+
+        return jsonify({
+            "error": "Email verification failed. Please try again."
+        }), 500
+
+    finally:
+
+        connection.close()
+
+
+# ==================================================
+# RESEND OTP
+# ==================================================
+
+@app.post("/api/auth/resend-otp")
+def resend_otp():
+
+    data = request.get_json(silent=True) or {}
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
+    if not EMAIL_REGEX.fullmatch(email):
+
+        return jsonify({
+            "error": "Please provide a valid email."
+        }), 400
+
+    connection = get_db()
+
+    try:
+
+        user = connection.execute("""
+            SELECT
+                id,
+                name,
+                email,
+                email_verified
+            FROM users
+            WHERE email = ?
+        """, (email,)).fetchone()
+
+        if not user:
+
+            return jsonify({
+                "error": "Account not found. Please register first."
+            }), 404
+
+        if user["email_verified"]:
+
+            return jsonify({
+                "message": "This email is already verified. You can log in."
+            }), 200
+
+        verification = connection.execute("""
+            SELECT last_sent_at
+            FROM email_verifications
+            WHERE user_id = ?
+        """, (user["id"],)).fetchone()
+
+        if verification:
+
+            now = datetime.now(timezone.utc)
+
+            elapsed = (
+                now - verification["last_sent_at"]
+            ).total_seconds()
+
+            remaining = OTP_RESEND_SECONDS - elapsed
+
+            if remaining > 0:
+
+                return jsonify({
+                    "error": f"Please wait {int(remaining) + 1} seconds before requesting another OTP."
+                }), 429
+
+        otp = create_email_otp(
+            connection,
+            user["id"]
+        )
+
+        connection.commit()
+
+        try:
+
+            send_verification_otp(
+                user,
+                otp
+            )
+
+        except Exception:
+
+            app.logger.exception(
+                "Resend OTP email failed."
+            )
+
+            return jsonify({
+                "error": "Unable to send OTP right now. Please try again later."
+            }), 500
+
+        return jsonify({
+            "message": "A new verification OTP has been sent to your email."
+        }), 200
+
+    except Exception:
+
+        connection.rollback()
+
+        app.logger.exception(
+            "Resend OTP failed."
+        )
+
+        return jsonify({
+            "error": "Unable to resend OTP. Please try again."
+        }), 500
+
+    finally:
+
+        connection.close()
+
+
+# ==================================================
+# LOGIN
+# ==================================================
 
 @app.post("/api/auth/login")
 def login():
+
     data = request.get_json(silent=True) or {}
-    email = str(data.get("email", "")).strip().lower()
-    password = str(data.get("password", ""))
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
+    password = str(
+        data.get("password", "")
+    )
+
+    if not email or not password:
+
+        return jsonify({
+            "error": "Email and password are required."
+        }), 400
 
     connection = get_db()
+
     try:
-        user = connection.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+
+        user = connection.execute(
+            "SELECT * FROM users WHERE email = ?",
+            (email,)
+        ).fetchone()
+
     finally:
+
         connection.close()
 
-    if not user or not check_password_hash(user["password_hash"], password):
-        return jsonify({"error": "Invalid email or password."}), 401
+    if not user or not check_password_hash(
+        user["password_hash"],
+        password
+    ):
+
+        return jsonify({
+            "error": "Invalid email or password."
+        }), 401
+
+    if not user["email_verified"]:
+
+        return jsonify({
+            "error": "Please verify your email before logging in.",
+            "verification_required": True,
+            "email": user["email"]
+        }), 403
 
     session.clear()
+
+    session.permanent = True
+
     session["user_id"] = user["id"]
     session["name"] = user["name"]
     session["email"] = user["email"]
     session["role"] = user["role"]
 
-    return jsonify({"message": "Login successful.", "user": get_public_user(user)})
+    return jsonify({
+        "message": "Login successful.",
+        "user": get_public_user(user)
+    })
 
+
+# ==================================================
+# CURRENT USER
+# ==================================================
 
 @app.get("/api/auth/me")
 @login_required
 def current_user():
-    connection = get_db()
-    try:
-        user = connection.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],)).fetchone()
-    finally:
-        connection.close()
-    if not user:
-        session.clear()
-        return jsonify({"error": "User not found."}), 404
-    return jsonify({"user": get_public_user(user)})
 
+    connection = get_db()
+
+    try:
+
+        user = connection.execute(
+            "SELECT * FROM users WHERE id = ?",
+            (session["user_id"],)
+        ).fetchone()
+
+    finally:
+
+        connection.close()
+
+    if not user:
+
+        session.clear()
+
+        return jsonify({
+            "error": "User not found."
+        }), 404
+
+    if not user["email_verified"]:
+
+        session.clear()
+
+        return jsonify({
+            "error": "Please verify your email."
+        }), 403
+
+    return jsonify({
+        "user": get_public_user(user)
+    })
+
+
+# ==================================================
+# LOGOUT
+# ==================================================
 
 @app.post("/api/auth/logout")
 @login_required
 def logout():
-    session.clear()
-    return jsonify({"message": "Logged out."})
 
+    session.clear()
+
+    return jsonify({
+        "message": "Logged out."
+    })
+
+
+# ==================================================
+# DELETE ACCOUNT
+# ==================================================
 
 @app.delete("/api/auth/account")
 @login_required
 def delete_account():
+
     if session.get("role") == "admin":
-        return jsonify({"error": "Admin account cannot be deleted."}), 403
+
+        return jsonify({
+            "error": "Admin account cannot be deleted."
+        }), 403
+
     connection = get_db()
+
     try:
-        connection.execute("DELETE FROM users WHERE id = ?", (session["user_id"],))
+
+        connection.execute(
+            "DELETE FROM users WHERE id = ?",
+            (session["user_id"],)
+        )
+
         connection.commit()
+
         session.clear()
-        return jsonify({"message": "Account deleted."})
+
+        return jsonify({
+            "message": "Account deleted."
+        })
+
     finally:
+
         connection.close()
 
 
 # ==================================================
-# PROFILE VISIT & ACTIVITY API
+# PROFILE VISIT & ACTIVITY
 # ==================================================
 
 @app.post("/api/profile/visit")
 @login_required
 def record_profile_visit():
+
     user_id = session["user_id"]
+
     today = date.today().isoformat()
+
     connection = get_db()
+
     try:
+
         connection.execute("""
-            INSERT INTO profile_visits (user_id, visit_date)
+            INSERT INTO profile_visits (
+                user_id,
+                visit_date
+            )
             VALUES (?, ?)
-            ON CONFLICT(user_id, visit_date) DO NOTHING
-        """, (user_id, today))
+            ON CONFLICT (user_id, visit_date)
+            DO NOTHING
+        """, (
+            user_id,
+            today
+        ))
+
         connection.commit()
-        return jsonify({"message": "Visit recorded."}), 200
+
+        return jsonify({
+            "message": "Visit recorded."
+        }), 200
+
     finally:
+
         connection.close()
 
 
 @app.get("/api/profile/activity")
 @login_required
 def get_profile_activity():
+
     user_id = session["user_id"]
+
     today = date.today()
+
     start_date = today - timedelta(days=6)
+
     connection = get_db()
+
     try:
+
         visit_rows = connection.execute("""
-            SELECT visit_date FROM profile_visits
-            WHERE user_id = ? AND visit_date BETWEEN ? AND ?
-        """, (user_id, start_date.isoformat(), today.isoformat())).fetchall()
-        visit_dates = {row["visit_date"] for row in visit_rows}
+            SELECT visit_date
+            FROM profile_visits
+            WHERE user_id = ?
+              AND visit_date BETWEEN ? AND ?
+        """, (
+            user_id,
+            start_date.isoformat(),
+            today.isoformat()
+        )).fetchall()
+
+        visit_dates = {
+            row["visit_date"]
+            for row in visit_rows
+        }
 
         task_rows = connection.execute("""
-            SELECT DATE(completed_at) AS completion_date, COUNT(*) AS task_count
+            SELECT
+                CAST(completed_at AS DATE) AS completion_date,
+                COUNT(*) AS task_count
             FROM roadmap_tasks
-            WHERE user_id = ? AND completed = 1 AND completed_at IS NOT NULL
-              AND DATE(completed_at) BETWEEN ? AND ?
-            GROUP BY DATE(completed_at)
-        """, (user_id, start_date.isoformat(), today.isoformat())).fetchall()
-        tasks_by_date = {row["completion_date"]: row["task_count"] for row in task_rows}
+            WHERE user_id = ?
+              AND completed = 1
+              AND completed_at IS NOT NULL
+              AND CAST(completed_at AS DATE) BETWEEN ? AND ?
+            GROUP BY CAST(completed_at AS DATE)
+        """, (
+            user_id,
+            start_date.isoformat(),
+            today.isoformat()
+        )).fetchall()
+
+        tasks_by_date = {}
+
+        for row in task_rows:
+
+            completion_date = row["completion_date"]
+
+            if hasattr(completion_date, "isoformat"):
+                completion_date = completion_date.isoformat()
+
+            tasks_by_date[completion_date] = row["task_count"]
 
         activity = []
+
         for offset in range(7):
+
             curr = start_date + timedelta(days=offset)
-            d_str = curr.isoformat()
+
+            date_string = curr.isoformat()
+
             activity.append({
-                "date": d_str,
+
+                "date": date_string,
+
                 "day": curr.strftime("%a"),
-                "visits": 1 if d_str in visit_dates else 0,
-                "tasks": int(tasks_by_date.get(d_str, 0))
+
+                "visits": (
+                    1 if date_string in visit_dates else 0
+                ),
+
+                "tasks": int(
+                    tasks_by_date.get(date_string, 0)
+                )
+
             })
 
+        active_days = sum(
+            1
+            for item in activity
+            if item["visits"] > 0 or item["tasks"] > 0
+        )
+
+        total_tasks = sum(
+            item["tasks"]
+            for item in activity
+        )
+
         return jsonify({
-            "total_tasks_completed": sum(i["tasks"] for i in activity),
-            "active_days": sum(1 for i in activity if i["visits"] > 0 or i["tasks"] > 0),
-            "consistency": round((sum(1 for i in activity if i["visits"] > 0 or i["tasks"] > 0) / 7) * 100),
+
+            "total_tasks_completed": total_tasks,
+
+            "active_days": active_days,
+
+            "consistency": round(
+                (active_days / 7) * 100
+            ),
+
             "activity": activity
+
         }), 200
+
     finally:
+
         connection.close()
 
 
 # ==================================================
-# ROADMAP APIs
+# ANALYSIS API
 # ==================================================
 
 @app.post("/api/analyze")
 def analyze():
+
     data = request.get_json(silent=True) or {}
+
     return jsonify({
+
         "mode": "demo",
-        "target_role": data.get("target_role", "Software Developer Intern"),
-        "skill_gaps": ["Git & GitHub", "Portfolio Project", "API Integration"],
-        "hiring_signals": ["Clean code", "Working demo link", "Structured documentation"],
-        "portfolio_ideas": [{"title": "Full-Stack Task App", "description": "Build a CRUD app."}]
+
+        "target_role": data.get(
+            "target_role",
+            "Software Developer Intern"
+        ),
+
+        "skill_gaps": [
+            "Git & GitHub",
+            "Portfolio Project",
+            "API Integration"
+        ],
+
+        "hiring_signals": [
+            "Clean code",
+            "Working demo link",
+            "Structured documentation"
+        ],
+
+        "portfolio_ideas": [
+            {
+                "title": "Full-Stack Task App",
+                "description": "Build a CRUD app."
+            }
+        ]
+
     })
 
+
+# ==================================================
+# ROADMAP API
+# ==================================================
 
 @app.post("/api/roadmap")
 def generate_roadmap():
+
     data = request.get_json(silent=True) or {}
-    role = data.get("target_role", "Software Developer")
-    weeks_count = int(data.get("duration_weeks", 4))
+
+    role = data.get(
+        "target_role",
+        "Software Developer"
+    )
+
+    try:
+
+        weeks_count = int(
+            data.get("duration_weeks", 4)
+        )
+
+    except (TypeError, ValueError):
+
+        return jsonify({
+            "error": "Duration must be a valid number."
+        }), 400
+
+    weeks_count = max(
+        1,
+        min(weeks_count, MAX_ROADMAP_WEEKS)
+    )
+
     return jsonify({
+
         "mode": "demo",
+
         "title": f"Learning Roadmap for {role}",
+
         "duration_weeks": weeks_count,
+
         "weeks": [
+
             {
+
                 "week": i,
+
                 "title": f"Week {i} Core Milestone",
+
                 "goal": "Build practical competencies.",
-                "topics": ["Basics", "Implementation"],
-                "tasks": [f"Complete exercise {i}.1", f"Commit code to GitHub for week {i}"],
+
+                "topics": [
+                    "Basics",
+                    "Implementation"
+                ],
+
+                "tasks": [
+                    f"Complete exercise {i}.1",
+                    f"Commit code to GitHub for week {i}"
+                ],
+
                 "mini_project": f"Project milestone {i}",
-                "resources": [{"name": "Official Docs", "url": "https://developer.mozilla.org"}]
+
+                "resources": [
+                    {
+                        "name": "Official Docs",
+                        "url": "https://developer.mozilla.org"
+                    }
+                ]
+
             }
+
             for i in range(1, weeks_count + 1)
+
         ]
+
     })
 
 
+# ==================================================
+# INITIALIZE DATABASE
+# ==================================================
+
+init_db()
+
+create_owner_admin()
+
+
+# ==================================================
+# RUN APPLICATION LOCALLY
+# ==================================================
+
 if __name__ == "__main__":
-    init_db()
-    create_owner_admin()
-    app.run(debug=True, host="127.0.0.1", port=5000)
+
+    app.run(
+        debug=False,
+        host="127.0.0.1",
+        port=5000
+    )
